@@ -1,6 +1,6 @@
 # 🎲 Likelihoodlum
 
-[![GitHub stars](https://img.shields.io/github/stars/gotnull/likelihoodlum?style=social)](https://github.com/gotnull/likelihoodlum/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/gotnull/likelihoodlum?style=social&cacheSeconds=60)](https://github.com/gotnull/likelihoodlum/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#installation)
