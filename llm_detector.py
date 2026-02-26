@@ -82,6 +82,14 @@ LPM_HUMAN_UPPER = 1.5  # ~90 LoC/hr – fast human, maybe some copy-paste
 LPM_SUSPICIOUS = 4.0  # ~240 LoC/hr – quite fast, could be assisted
 LPM_VERY_SUSPICIOUS = 10.0  # ~600 LoC/hr – almost certainly not hand-typed
 
+# Daily output thresholds (authored lines per active day).
+# A senior engineer writing production code typically produces 200-500 lines/day.
+# These thresholds are deliberately generous to avoid false positives.
+DAILY_OUTPUT_CLEARLY_HUMAN = 300  # Solid day of focused human work
+DAILY_OUTPUT_HUMAN_UPPER = 800  # Very fast human, some scaffolding likely
+DAILY_OUTPUT_SUSPICIOUS = 2000  # Hard to sustain without assistance
+DAILY_OUTPUT_VERY_SUSPICIOUS = 5000  # Almost certainly not hand-written
+
 # Minimum minutes between commits to consider for velocity calc.
 # Commits less than 1 min apart are likely amend/rebase artifacts.
 MIN_COMMIT_GAP_MINUTES = 1.0
@@ -657,7 +665,60 @@ def score_repo(
                 f"show extreme velocity (>50 lines/min ≈ 3000 lines/hr) [{pts:+.0f}]"
             )
 
-    # --- 8. Generated file ratio signal ---
+    # --- 8. Project-scale plausibility (0-20 pts, can subtract up to -5) ---
+    # Compare total authored output against calendar span and active days.
+    # Even if per-commit velocity is borderline, producing 140K lines in 13
+    # days is a dead giveaway.
+    if len(commits) >= 5:
+        total_authored = sum(c["authored_total"] for c in commits)
+        first_ts = commits[0]["timestamp"]
+        last_ts = commits[-1]["timestamp"]
+        calendar_days = max((last_ts - first_ts).total_seconds() / 86400, 1)
+
+        # Count distinct active days (days with at least one commit)
+        active_dates: set[str] = set()
+        for c in commits:
+            a = c.get("author_login") or c.get("author_name") or "unknown"
+            if not is_bot_author(a):
+                active_dates.add(c["timestamp"].strftime("%Y-%m-%d"))
+        active_days = max(len(active_dates), 1)
+
+        daily_output_calendar = total_authored / calendar_days
+        daily_output_active = total_authored / active_days
+
+        # Use active-day rate as the primary metric (fairer for weekend gaps)
+        daily_rate = daily_output_active
+
+        if daily_rate >= DAILY_OUTPUT_VERY_SUSPICIOUS:
+            score += 20
+            reasons.append(
+                f"Project-scale output is implausible: {total_authored:,} authored lines "
+                f"over {calendar_days:.0f} days ({active_days} active) "
+                f"= {daily_rate:,.0f} lines/active day [+20]"
+            )
+        elif daily_rate >= DAILY_OUTPUT_SUSPICIOUS:
+            score += 12
+            reasons.append(
+                f"Project-scale output is very high: {total_authored:,} authored lines "
+                f"over {calendar_days:.0f} days ({active_days} active) "
+                f"= {daily_rate:,.0f} lines/active day [+12]"
+            )
+        elif daily_rate >= DAILY_OUTPUT_HUMAN_UPPER:
+            score += 5
+            reasons.append(
+                f"Project-scale output is above average: {total_authored:,} authored lines "
+                f"over {calendar_days:.0f} days ({active_days} active) "
+                f"= {daily_rate:,.0f} lines/active day [+5]"
+            )
+        elif daily_rate < DAILY_OUTPUT_CLEARLY_HUMAN and calendar_days >= 14:
+            penalty = -5
+            score += penalty
+            reasons.append(
+                f"Project-scale output is consistent with human pace: "
+                f"{daily_rate:,.0f} lines/active day over {calendar_days:.0f} days [{penalty:+.0f}]"
+            )
+
+    # --- 9. Generated file ratio signal ---
     total_all_changes = sum(c["total_changes"] for c in commits)
     total_generated = sum(c["generated_total"] for c in commits)
     if total_all_changes > 0:
@@ -746,6 +807,35 @@ def print_report(
     print(f"   Total:     {total_all:,}")
     print(f"   Authored:  {total_authored:,} (used for analysis)")
     print(f"   Generated: {total_generated:,} (filtered out)")
+
+    # Project-scale output
+    if commits:
+        first_ts = commits[0]["timestamp"]
+        last_ts = commits[-1]["timestamp"]
+        calendar_days = max((last_ts - first_ts).total_seconds() / 86400, 1)
+        active_dates = set()
+        for c in commits:
+            a = c.get("author_login") or c.get("author_name") or "unknown"
+            if not is_bot_author(a):
+                active_dates.add(c["timestamp"].strftime("%Y-%m-%d"))
+        active_days = max(len(active_dates), 1)
+        daily_rate = total_authored / active_days
+        daily_rate_cal = total_authored / calendar_days
+        print(f"\n📈 Project-scale output:")
+        print(
+            f"   Active days:          {active_days} (of {calendar_days:.0f} calendar days)"
+        )
+        print(f"   Lines/active day:     {daily_rate:,.0f}")
+        print(f"   Lines/calendar day:   {daily_rate_cal:,.0f}")
+        flag = ""
+        if daily_rate >= DAILY_OUTPUT_VERY_SUSPICIOUS:
+            flag = " ⚠️  (>5,000 — implausible for a human)"
+        elif daily_rate >= DAILY_OUTPUT_SUSPICIOUS:
+            flag = " ⚠️  (>2,000 — very high)"
+        elif daily_rate >= DAILY_OUTPUT_HUMAN_UPPER:
+            flag = " (above average)"
+        if flag:
+            print(f"   {flag}")
 
     # Velocity stats
     if velocities:
@@ -943,6 +1033,51 @@ def main() -> None:
                 "total": sum(c["total_changes"] for c in commits),
                 "authored": sum(c["authored_total"] for c in commits),
                 "generated": sum(c["generated_total"] for c in commits),
+            },
+            "project_scale": {
+                "calendar_days": round(
+                    max(
+                        (
+                            commits[-1]["timestamp"] - commits[0]["timestamp"]
+                        ).total_seconds()
+                        / 86400,
+                        1,
+                    ),
+                    1,
+                )
+                if commits
+                else None,
+                "active_days": len(
+                    set(
+                        c["timestamp"].strftime("%Y-%m-%d")
+                        for c in commits
+                        if not is_bot_author(
+                            c.get("author_login") or c.get("author_name") or "unknown"
+                        )
+                    )
+                )
+                if commits
+                else None,
+                "lines_per_active_day": round(
+                    sum(c["authored_total"] for c in commits)
+                    / max(
+                        len(
+                            set(
+                                c["timestamp"].strftime("%Y-%m-%d")
+                                for c in commits
+                                if not is_bot_author(
+                                    c.get("author_login")
+                                    or c.get("author_name")
+                                    or "unknown"
+                                )
+                            )
+                        ),
+                        1,
+                    ),
+                    0,
+                )
+                if commits
+                else None,
             },
             "message_analysis": msg_analysis,
             "sessions": len(sessions),
