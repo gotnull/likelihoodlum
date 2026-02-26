@@ -149,6 +149,9 @@ def is_generated_file(filename: str) -> bool:
     return False
 
 
+# Known bot author suffixes — excluded from author counts and velocity.
+BOT_AUTHOR_SUFFIXES = ["[bot]", "-bot", "_bot"]
+
 # Commit message patterns that are suspiciously "LLM-like".
 # These are deliberately tighter than before – we want to catch the
 # robotic-sounding messages, not normal dev shorthand.
@@ -162,14 +165,24 @@ LLM_MESSAGE_PATTERNS = [
     r"^(refactor|improve|enhance|optimize)\s+.{30,}",
     # "Update X to Y" with very specific phrasing
     r"^update\s+\w+\s+to\s+(handle|support|include|use|implement)",
-    # Conventional commits with long scopes (AI tends to over-specify)
+    # Conventional commits with scopes — LLMs love over-specifying scopes
     r"^(feat|fix|docs|style|refactor|perf|test|chore)\(.{15,}\):",
+    # Conventional commits with any scope + verbose description (>40 chars after colon)
+    r"^(feat|fix|docs|style|refactor|perf|test|chore)\([^)]+\):\s+.{40,}",
+    # Conventional commits with comma-separated or slash-separated multi-scopes
+    r"^(feat|fix|docs|style|refactor|perf|test|chore)\([^)]*[,/][^)]*\):",
     # Messages that read like documentation
     r"^(ensure|make sure|modify)\s+.{20,}",
     # "Fix issue with X" or "Fix bug in X" — overly descriptive
     r"^fix\s+(issue|bug|problem|error)\s+(with|in|for|related\s+to)\s+",
     # Messages that list what was done (LLMs love bullet-point style)
     r"^(add|implement|create|update|fix)\s+.*\s+and\s+(add|implement|create|update|fix)\s+",
+    # "Add <noun> <noun>" — short but formulaic (e.g. "Add user authentication")
+    r"^add\s+\w+\s+\w+\s+\w+",
+    # Descriptive verb phrases that sound like task descriptions
+    r"^(integrate|wire up|set up|hook up|connect|configure)\s+.{15,}",
+    # "Enhance X with Y" — very LLM-y phrasing
+    r"^enhance\s+\w+\s+with\s+",
 ]
 
 # ---------------------------------------------------------------------------
@@ -274,18 +287,30 @@ def compute_authored_changes(files: list[dict]) -> dict:
     }
 
 
+def is_bot_author(name: str) -> bool:
+    """Return True if the author name looks like a bot account."""
+    lower = name.lower()
+    for suffix in BOT_AUTHOR_SUFFIXES:
+        if lower.endswith(suffix):
+            return True
+    return False
+
+
 def compute_velocity(commits_chrono: list[dict]) -> list[dict]:
     """
     Given commits in chronological order (oldest first), compute lines-per-minute
     between consecutive commits by the same author.
 
     Uses authored_total (excluding generated files) for the calculation.
+    Bot authors are excluded.
     """
     velocities: list[dict] = []
     prev_by_author: dict[str, dict] = {}
 
     for c in commits_chrono:
         author = c.get("author_login") or c.get("author_name") or "unknown"
+        if is_bot_author(author):
+            continue
         ts = c["timestamp"]
         authored_changes = c["authored_total"]
 
@@ -311,10 +336,12 @@ def compute_velocity(commits_chrono: list[dict]) -> list[dict]:
 
 
 def build_sessions(commits_chrono: list[dict]) -> list[list[dict]]:
-    """Group commits into coding sessions per author."""
+    """Group commits into coding sessions per author (excluding bots)."""
     by_author: dict[str, list[dict]] = defaultdict(list)
     for c in commits_chrono:
         author = c.get("author_login") or c.get("author_name") or "unknown"
+        if is_bot_author(author):
+            continue
         by_author[author].append(c)
 
     sessions: list[list[dict]] = []
@@ -531,36 +558,47 @@ def score_repo(
         reasons.append(
             f"{msg_ratio * 100:.0f}% of commit messages match LLM-typical patterns"
         )
+    # Low message match but very high velocity = still suspicious
+    elif msg_ratio <= 0.15 and velocities:
+        lpms_check = [v["lines_per_minute"] for v in velocities]
+        if statistics.median(lpms_check) >= LPM_SUSPICIOUS:
+            score += 2
+            reasons.append(
+                f"Commit messages look clean but velocity is high — "
+                f"possible curated LLM workflow"
+            )
 
     # --- 5. Burst detection (0-15 pts) ---
-    # A burst = many commits with lots of authored code in a short window
+    # A burst = commits with lots of authored code in a short window
     burst_count = 0
     for sess in sessions:
-        if len(sess) >= 3:
+        if len(sess) >= 2:
             duration = (
                 sess[-1]["timestamp"] - sess[0]["timestamp"]
             ).total_seconds() / 60.0
             total_authored = sum(c["authored_total"] for c in sess)
-            if duration < 30 and total_authored > 500:
+            if duration < 30 and total_authored > 300:
                 burst_count += 1
 
     if burst_count >= 5:
         score += 15
         reasons.append(
-            f"{burst_count} burst sessions detected (>500 authored lines in <30 min)"
+            f"{burst_count} burst sessions detected (>300 authored lines in <30 min)"
         )
     elif burst_count >= 3:
-        score += 8
+        score += 10
         reasons.append(f"{burst_count} burst sessions detected")
     elif burst_count >= 1:
-        score += 3
+        score += 4
         reasons.append(f"{burst_count} burst session detected")
 
     # --- 6. Multi-author discount (0 to -10 pts) ---
+    # Exclude bot accounts from the author count
     authors = set()
     for c in commits:
         a = c.get("author_login") or c.get("author_name") or "unknown"
-        authors.add(a)
+        if not is_bot_author(a):
+            authors.add(a)
 
     if len(authors) >= 5:
         penalty = -10
@@ -576,7 +614,23 @@ def score_repo(
         score += 5
         reasons.append("Solo author — consistent with LLM-assisted workflow [+5]")
 
-    # --- 7. Generated file ratio signal ---
+    # --- 7. High per-commit velocity (0-10 pts) ---
+    # If individual commits are huge relative to the time gap, that's suspicious
+    # even if session-level metrics are diluted.
+    if velocities:
+        lpms_all = [v["lines_per_minute"] for v in velocities]
+        # Count intervals where velocity exceeds 50 lines/min (3000 lines/hr)
+        extreme_count = sum(1 for l in lpms_all if l >= 50.0)
+        extreme_pct = extreme_count / len(lpms_all)
+        if extreme_pct >= 0.05:
+            pts = min(10, round(extreme_pct * 30, 1))
+            score += pts
+            reasons.append(
+                f"{extreme_count} commit intervals ({extreme_pct * 100:.0f}%) "
+                f"show extreme velocity (>50 lines/min ≈ 3000 lines/hr) [{pts:+.0f}]"
+            )
+
+    # --- 8. Generated file ratio signal ---
     total_all_changes = sum(c["total_changes"] for c in commits)
     total_generated = sum(c["generated_total"] for c in commits)
     if total_all_changes > 0:
