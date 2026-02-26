@@ -40,6 +40,7 @@ import re
 import statistics
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -197,6 +198,10 @@ LLM_MESSAGE_PATTERNS = [
 # GitHub API helpers
 # ---------------------------------------------------------------------------
 
+# Max parallel requests when fetching commit details.
+# Stay well under GitHub's abuse-detection limits.
+MAX_WORKERS = 10
+
 
 def github_api(endpoint: str, token: str | None = None) -> Any:
     """Make a GitHub REST API request and return parsed JSON."""
@@ -221,6 +226,11 @@ def github_api(endpoint: str, token: str | None = None) -> Any:
         elif exc.code == 404:
             print(f"⚠  Repository not found: {endpoint}", file=sys.stderr)
         raise SystemExit(1)
+
+
+def fetch_repo_metadata(owner: str, repo: str, token: str | None) -> dict:
+    """Fetch repository metadata (creation date, description, etc.)."""
+    return github_api(f"/repos/{owner}/{repo}", token)
 
 
 def fetch_commits(
@@ -409,6 +419,7 @@ def score_repo(
     sessions: list[list[dict]],
     msg_analysis: dict,
     commits: list[dict],
+    repo_created_at: datetime | None = None,
 ) -> dict:
     """
     Compute a composite LLM-likelihood score from 0-100.
@@ -666,16 +677,22 @@ def score_repo(
             )
 
     # --- 8. Project-scale plausibility (0-20 pts, can subtract up to -5) ---
-    # Compare total authored output against calendar span and active days.
-    # Even if per-commit velocity is borderline, producing 140K lines in 13
-    # days is a dead giveaway.
+    # Compare total authored output against the project's true lifespan.
+    # Use the repo creation date (from GitHub metadata) when available,
+    # otherwise fall back to the oldest fetched commit.
     if len(commits) >= 5:
         total_authored = sum(c["authored_total"] for c in commits)
-        first_ts = commits[0]["timestamp"]
         last_ts = commits[-1]["timestamp"]
+
+        # Prefer the true repo creation date over the oldest fetched commit
+        if repo_created_at is not None:
+            first_ts = repo_created_at
+        else:
+            first_ts = commits[0]["timestamp"]
+
         calendar_days = max((last_ts - first_ts).total_seconds() / 86400, 1)
 
-        # Count distinct active days (days with at least one commit)
+        # Count distinct active days (days with at least one non-bot commit)
         active_dates: set[str] = set()
         for c in commits:
             a = c.get("author_login") or c.get("author_name") or "unknown"
@@ -777,6 +794,7 @@ def print_report(
     sessions: list[list[dict]],
     msg_analysis: dict,
     result: dict,
+    repo_created_at: datetime | None = None,
 ) -> None:
     w = 60
     print()
@@ -810,7 +828,10 @@ def print_report(
 
     # Project-scale output
     if commits:
-        first_ts = commits[0]["timestamp"]
+        if repo_created_at is not None:
+            first_ts = repo_created_at
+        else:
+            first_ts = commits[0]["timestamp"]
         last_ts = commits[-1]["timestamp"]
         calendar_days = max((last_ts - first_ts).total_seconds() / 86400, 1)
         active_dates = set()
@@ -822,6 +843,8 @@ def print_report(
         daily_rate = total_authored / active_days
         daily_rate_cal = total_authored / calendar_days
         print(f"\n📈 Project-scale output:")
+        if repo_created_at is not None:
+            print(f"   Repo created:         {repo_created_at.strftime('%Y-%m-%d')}")
         print(
             f"   Active days:          {active_days} (of {calendar_days:.0f} calendar days)"
         )
@@ -950,6 +973,11 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    # Fetch repo metadata (creation date) — 1 API call
+    print(f"🔍 Fetching repo metadata for {owner}/{repo}...", file=sys.stderr)
+    repo_meta = fetch_repo_metadata(owner, repo, args.token)
+    repo_created_at = parse_iso(repo_meta.get("created_at", "2000-01-01T00:00:00Z"))
+
     # Fetch commits
     print(f"🔍 Fetching commits for {owner}/{repo}...", file=sys.stderr)
     raw_commits = fetch_commits(owner, repo, args.token, args.branch, args.max_commits)
@@ -958,50 +986,89 @@ def main() -> None:
         print("No commits found.", file=sys.stderr)
         raise SystemExit(1)
 
-    print(f"   Found {len(raw_commits)} commits. Fetching details...", file=sys.stderr)
+    # Filter out bot commits before fetching details — saves API calls
+    human_commits = []
+    bot_commits = []
+    for rc in raw_commits:
+        login = (rc.get("author") or {}).get("login", "")
+        name = (rc.get("commit", {}).get("author") or {}).get("name", "")
+        author_id = login or name or "unknown"
+        if is_bot_author(author_id):
+            bot_commits.append(rc)
+        else:
+            human_commits.append(rc)
 
-    # Fetch detailed stats for each commit (this is the slow part)
-    commits: list[dict] = []
-    for i, rc in enumerate(raw_commits):
-        sha = rc["sha"]
-        if (i + 1) % 20 == 0 or i == 0:
-            print(
-                f"   Processing commit {i + 1}/{len(raw_commits)}...", file=sys.stderr
-            )
-
-        detail = fetch_commit_detail(owner, repo, sha, args.token)
-        stats = detail.get("stats", {})
-        files = detail.get("files", [])
-
-        # Separate authored vs generated file changes
-        change_breakdown = compute_authored_changes(files)
-
-        commit_info = rc.get("commit", {})
-        author_info = commit_info.get("author", {})
-        committer_info = commit_info.get("committer", {})
-
-        commits.append(
-            {
-                "sha": sha,
-                "message": commit_info.get("message", ""),
-                "author_name": author_info.get("name", "unknown"),
-                "author_login": (rc.get("author") or {}).get("login"),
-                "timestamp": parse_iso(
-                    author_info.get(
-                        "date", committer_info.get("date", "2000-01-01T00:00:00Z")
-                    )
-                ),
-                "additions": stats.get("additions", 0),
-                "deletions": stats.get("deletions", 0),
-                "total_changes": stats.get("total", 0),
-                "files_changed": len(files),
-                # Filtered metrics
-                "authored_total": change_breakdown["authored_total"],
-                "authored_additions": change_breakdown["authored_additions"],
-                "authored_deletions": change_breakdown["authored_deletions"],
-                "generated_total": change_breakdown["generated_total"],
-            }
+    if bot_commits:
+        print(
+            f"   Found {len(raw_commits)} commits "
+            f"({len(bot_commits)} bot commits skipped). "
+            f"Fetching details for {len(human_commits)}...",
+            file=sys.stderr,
         )
+    else:
+        print(
+            f"   Found {len(raw_commits)} commits. Fetching details...",
+            file=sys.stderr,
+        )
+
+    # Fetch detailed stats concurrently — dramatically faster than sequential
+    def _fetch_one(idx_rc: tuple[int, dict]) -> tuple[int, dict, dict]:
+        idx, rc = idx_rc
+        sha = rc["sha"]
+        detail = fetch_commit_detail(owner, repo, sha, args.token)
+        return idx, rc, detail
+
+    commits: list[dict] = []
+    workers = min(MAX_WORKERS, len(human_commits)) or 1
+    done_count = 0
+    total_to_fetch = len(human_commits)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_fetch_one, (i, rc)): i for i, rc in enumerate(human_commits)
+        }
+        for future in as_completed(futures):
+            done_count += 1
+            if done_count % 20 == 0 or done_count == 1 or done_count == total_to_fetch:
+                print(
+                    f"   Processing commit {done_count}/{total_to_fetch}...",
+                    file=sys.stderr,
+                )
+
+            idx, rc, detail = future.result()
+            stats = detail.get("stats", {})
+            files = detail.get("files", [])
+
+            # Separate authored vs generated file changes
+            change_breakdown = compute_authored_changes(files)
+
+            commit_info = rc.get("commit", {})
+            author_info = commit_info.get("author", {})
+            committer_info = commit_info.get("committer", {})
+
+            commits.append(
+                {
+                    "sha": rc["sha"],
+                    "message": commit_info.get("message", ""),
+                    "author_name": author_info.get("name", "unknown"),
+                    "author_login": (rc.get("author") or {}).get("login"),
+                    "timestamp": parse_iso(
+                        author_info.get(
+                            "date",
+                            committer_info.get("date", "2000-01-01T00:00:00Z"),
+                        )
+                    ),
+                    "additions": stats.get("additions", 0),
+                    "deletions": stats.get("deletions", 0),
+                    "total_changes": stats.get("total", 0),
+                    "files_changed": len(files),
+                    # Filtered metrics
+                    "authored_total": change_breakdown["authored_total"],
+                    "authored_additions": change_breakdown["authored_additions"],
+                    "authored_deletions": change_breakdown["authored_deletions"],
+                    "generated_total": change_breakdown["generated_total"],
+                }
+            )
 
     # Sort chronologically (oldest first)
     commits.sort(key=lambda c: c["timestamp"])
@@ -1010,7 +1077,7 @@ def main() -> None:
     velocities = compute_velocity(commits)
     sessions = build_sessions(commits)
     msg_analysis = analyze_messages(commits)
-    result = score_repo(velocities, sessions, msg_analysis, commits)
+    result = score_repo(velocities, sessions, msg_analysis, commits, repo_created_at)
 
     if args.json_output:
         velocity_lpms = [v["lines_per_minute"] for v in velocities]
@@ -1034,51 +1101,55 @@ def main() -> None:
                 "authored": sum(c["authored_total"] for c in commits),
                 "generated": sum(c["generated_total"] for c in commits),
             },
-            "project_scale": {
-                "calendar_days": round(
-                    max(
-                        (
-                            commits[-1]["timestamp"] - commits[0]["timestamp"]
-                        ).total_seconds()
-                        / 86400,
-                        1,
-                    ),
-                    1,
-                )
-                if commits
-                else None,
-                "active_days": len(
-                    set(
-                        c["timestamp"].strftime("%Y-%m-%d")
-                        for c in commits
-                        if not is_bot_author(
-                            c.get("author_login") or c.get("author_name") or "unknown"
-                        )
-                    )
-                )
-                if commits
-                else None,
-                "lines_per_active_day": round(
-                    sum(c["authored_total"] for c in commits)
-                    / max(
-                        len(
-                            set(
-                                c["timestamp"].strftime("%Y-%m-%d")
-                                for c in commits
-                                if not is_bot_author(
-                                    c.get("author_login")
-                                    or c.get("author_name")
-                                    or "unknown"
-                                )
-                            )
+            "project_scale": (
+                lambda: {
+                    "repo_created_at": repo_created_at.isoformat()
+                    if repo_created_at
+                    else None,
+                    "calendar_days": round(
+                        max(
+                            (
+                                commits[-1]["timestamp"]
+                                - (repo_created_at or commits[0]["timestamp"])
+                            ).total_seconds()
+                            / 86400,
+                            1,
                         ),
                         1,
                     ),
-                    0,
-                )
-                if commits
-                else None,
-            },
+                    "active_days": len(
+                        set(
+                            c["timestamp"].strftime("%Y-%m-%d")
+                            for c in commits
+                            if not is_bot_author(
+                                c.get("author_login")
+                                or c.get("author_name")
+                                or "unknown"
+                            )
+                        )
+                    ),
+                    "lines_per_active_day": round(
+                        sum(c["authored_total"] for c in commits)
+                        / max(
+                            len(
+                                set(
+                                    c["timestamp"].strftime("%Y-%m-%d")
+                                    for c in commits
+                                    if not is_bot_author(
+                                        c.get("author_login")
+                                        or c.get("author_name")
+                                        or "unknown"
+                                    )
+                                )
+                            ),
+                            1,
+                        ),
+                        0,
+                    ),
+                }
+            )()
+            if commits
+            else None,
             "message_analysis": msg_analysis,
             "sessions": len(sessions),
             "authors": len(
@@ -1090,7 +1161,16 @@ def main() -> None:
         }
         print(json.dumps(output, indent=2, default=str))
     else:
-        print_report(owner, repo, commits, velocities, sessions, msg_analysis, result)
+        print_report(
+            owner,
+            repo,
+            commits,
+            velocities,
+            sessions,
+            msg_analysis,
+            result,
+            repo_created_at,
+        )
 
 
 if __name__ == "__main__":
