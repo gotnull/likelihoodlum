@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LLM-Generated Code Detector
+LLM-Generated Code Detector (Likelihoodlum)
 
 Analyzes a GitHub repository's commit history to estimate the likelihood
 that the code was written by an LLM rather than a human.
@@ -14,8 +14,12 @@ Heuristics used:
      measures productivity per session.
   4. Commit size uniformity: LLM-generated commits tend to be uniformly large,
      while human commits vary more in size.
-  5. Time-of-day patterns: perfectly regular commit timing can be suspicious.
-  6. Commit message analysis: generic / overly-perfect commit messages.
+  5. Commit message analysis: generic / overly-perfect commit messages.
+  6. Multi-author discount: real projects tend to have multiple contributors.
+  7. Negative signals: clearly human velocity patterns actively reduce the score.
+
+Generated / vendor files (protos, lockfiles, Xcode project files, etc.) are
+filtered out so they don't inflate velocity measurements.
 
 Usage:
     python3 llm_detector.py <github_repo_url_or_owner/repo> [--token GITHUB_TOKEN]
@@ -72,22 +76,100 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 # apart we consider them to be in different coding sessions.
 SESSION_GAP_MINUTES = 120
 
-# Lines-per-minute thresholds
-LPM_HUMAN_TYPICAL = 0.5  # ~30 LoC / hour – a productive human
-LPM_SUSPICIOUS = 3.0  # ~180 LoC / hour – very fast
-LPM_VERY_SUSPICIOUS = 8.0  # ~480 LoC / hour – almost certainly assisted
+# Lines-per-minute thresholds (applied to non-generated code only)
+LPM_CLEARLY_HUMAN = 0.5  # ~30 LoC/hr – normal productive human
+LPM_HUMAN_UPPER = 1.5  # ~90 LoC/hr – fast human, maybe some copy-paste
+LPM_SUSPICIOUS = 4.0  # ~240 LoC/hr – quite fast, could be assisted
+LPM_VERY_SUSPICIOUS = 10.0  # ~600 LoC/hr – almost certainly not hand-typed
 
 # Minimum minutes between commits to consider for velocity calc.
 # Commits less than 1 min apart are likely amend/rebase artifacts.
 MIN_COMMIT_GAP_MINUTES = 1.0
 
-# Commit message patterns that are suspiciously "LLM-like"
+# File extensions / patterns considered generated, vendored, or non-authored.
+# Changes to these files are excluded from velocity calculations.
+GENERATED_FILE_PATTERNS = [
+    # Lock files & dependency manifests
+    r"package-lock\.json$",
+    r"yarn\.lock$",
+    r"Podfile\.lock$",
+    r"Gemfile\.lock$",
+    r"composer\.lock$",
+    r"Cargo\.lock$",
+    r"poetry\.lock$",
+    r"pnpm-lock\.yaml$",
+    r"go\.sum$",
+    # Xcode / Apple
+    r"\.pbxproj$",
+    r"\.xcworkspacedata$",
+    r"\.xcscheme$",
+    r"project\.pbxproj$",
+    r"contents\.xcworkspacedata$",
+    # Proto / generated
+    r"\.pb\.go$",
+    r"\.pb\.swift$",
+    r"\.pb\.h$",
+    r"\.pb\.cc$",
+    r"\.pb\.m$",
+    r"_pb2\.py$",
+    r"_pb2_grpc\.py$",
+    r"\.proto$",
+    r"\.g\.dart$",
+    r"\.freezed\.dart$",
+    r"\.gen\.go$",
+    r"\.generated\.",
+    # Build artifacts & configs
+    r"\.min\.js$",
+    r"\.min\.css$",
+    r"\.map$",
+    r"dist/",
+    r"build/",
+    r"vendor/",
+    r"node_modules/",
+    r"\.DS_Store$",
+    # Data / assets
+    r"\.json$",  # most JSON is config/data, not hand-authored code
+    r"\.svg$",
+    r"\.png$",
+    r"\.jpg$",
+    r"\.ico$",
+    r"\.woff",
+    r"\.ttf$",
+    r"\.eot$",
+]
+
+_GENERATED_RE = [re.compile(p, re.IGNORECASE) for p in GENERATED_FILE_PATTERNS]
+
+
+def is_generated_file(filename: str) -> bool:
+    """Return True if a filename looks like a generated/vendored file."""
+    for pat in _GENERATED_RE:
+        if pat.search(filename):
+            return True
+    return False
+
+
+# Commit message patterns that are suspiciously "LLM-like".
+# These are deliberately tighter than before – we want to catch the
+# robotic-sounding messages, not normal dev shorthand.
 LLM_MESSAGE_PATTERNS = [
-    r"^(add|create|implement|update|fix|refactor|improve|enhance)\s",
-    r"^(feat|fix|docs|style|refactor|perf|test|chore)\(.+\):\s",  # conventional commits (not bad per se, but scored lightly)
-    r"initial commit",
-    r"^update \S+$",
-    r"^add \S+$",
+    # Overly formal "Implement/Create" with a noun phrase
+    r"^implement\s+\w+",
+    r"^create\s+(the\s+)?\w+\s+(component|module|service|function|class|endpoint|handler|middleware|util)",
+    # "Add X functionality/feature/support"
+    r"^add\s+\w+\s+(functionality|feature|support|implementation|capability|module|component)",
+    # Refactor/improve/enhance with a long description (LLMs love these)
+    r"^(refactor|improve|enhance|optimize)\s+.{30,}",
+    # "Update X to Y" with very specific phrasing
+    r"^update\s+\w+\s+to\s+(handle|support|include|use|implement)",
+    # Conventional commits with long scopes (AI tends to over-specify)
+    r"^(feat|fix|docs|style|refactor|perf|test|chore)\(.{15,}\):",
+    # Messages that read like documentation
+    r"^(ensure|make sure|modify)\s+.{20,}",
+    # "Fix issue with X" or "Fix bug in X" — overly descriptive
+    r"^fix\s+(issue|bug|problem|error)\s+(with|in|for|related\s+to)\s+",
+    # Messages that list what was done (LLMs love bullet-point style)
+    r"^(add|implement|create|update|fix)\s+.*\s+and\s+(add|implement|create|update|fix)\s+",
 ]
 
 # ---------------------------------------------------------------------------
@@ -100,7 +182,7 @@ def github_api(endpoint: str, token: str | None = None) -> Any:
     url = f"https://api.github.com{endpoint}"
     headers = {
         "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "llm-detector-script",
+        "User-Agent": "likelihoodlum",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -142,7 +224,7 @@ def fetch_commits(
 
 
 def fetch_commit_detail(owner: str, repo: str, sha: str, token: str | None) -> dict:
-    """Fetch full detail (including stats) for a single commit."""
+    """Fetch full detail (including stats and file list) for a single commit."""
     return github_api(f"/repos/{owner}/{repo}/commits/{sha}", token)
 
 
@@ -153,9 +235,43 @@ def fetch_commit_detail(owner: str, repo: str, sha: str, token: str | None) -> d
 
 def parse_iso(datestr: str) -> datetime:
     """Parse a GitHub ISO-8601 date string into a timezone-aware datetime."""
-    # GitHub returns dates like 2024-01-15T08:30:00Z
     datestr = datestr.replace("Z", "+00:00")
     return datetime.fromisoformat(datestr)
+
+
+def compute_authored_changes(files: list[dict]) -> dict:
+    """
+    Separate a commit's file changes into authored vs generated.
+
+    Returns dict with:
+        authored_additions, authored_deletions, authored_total,
+        generated_total, authored_files, generated_files
+    """
+    authored_add = 0
+    authored_del = 0
+    generated_total = 0
+    authored_filenames = []
+    generated_filenames = []
+
+    for f in files:
+        filename = f.get("filename", "")
+        changes = f.get("additions", 0) + f.get("deletions", 0)
+        if is_generated_file(filename):
+            generated_total += changes
+            generated_filenames.append(filename)
+        else:
+            authored_add += f.get("additions", 0)
+            authored_del += f.get("deletions", 0)
+            authored_filenames.append(filename)
+
+    return {
+        "authored_additions": authored_add,
+        "authored_deletions": authored_del,
+        "authored_total": authored_add + authored_del,
+        "generated_total": generated_total,
+        "authored_files": authored_filenames,
+        "generated_files": generated_filenames,
+    }
 
 
 def compute_velocity(commits_chrono: list[dict]) -> list[dict]:
@@ -163,7 +279,7 @@ def compute_velocity(commits_chrono: list[dict]) -> list[dict]:
     Given commits in chronological order (oldest first), compute lines-per-minute
     between consecutive commits by the same author.
 
-    Returns a list of dicts with velocity info.
+    Uses authored_total (excluding generated files) for the calculation.
     """
     velocities: list[dict] = []
     prev_by_author: dict[str, dict] = {}
@@ -171,20 +287,20 @@ def compute_velocity(commits_chrono: list[dict]) -> list[dict]:
     for c in commits_chrono:
         author = c.get("author_login") or c.get("author_name") or "unknown"
         ts = c["timestamp"]
-        total_changes = c["total_changes"]
+        authored_changes = c["authored_total"]
 
         if author in prev_by_author:
             prev = prev_by_author[author]
             gap = (ts - prev["timestamp"]).total_seconds() / 60.0
             if gap >= MIN_COMMIT_GAP_MINUTES:
-                lpm = total_changes / gap if gap > 0 else 0
+                lpm = authored_changes / gap if gap > 0 else 0
                 velocities.append(
                     {
                         "sha_from": prev["sha"][:8],
                         "sha_to": c["sha"][:8],
                         "author": author,
                         "gap_minutes": round(gap, 1),
-                        "lines_changed": total_changes,
+                        "lines_changed": authored_changes,
                         "lines_per_minute": round(lpm, 2),
                     }
                 )
@@ -224,11 +340,12 @@ def analyze_messages(commits: list[dict]) -> dict:
     flagged: list[str] = []
 
     for c in commits:
-        msg = c.get("message", "").strip().split("\n")[0].lower()
+        msg = c.get("message", "").strip().split("\n")[0]
+        msg_lower = msg.lower()
         for pat in LLM_MESSAGE_PATTERNS:
-            if re.search(pat, msg, re.IGNORECASE):
+            if re.search(pat, msg_lower):
                 pattern_hits += 1
-                flagged.append(c.get("message", "").strip().split("\n")[0])
+                flagged.append(msg)
                 break
 
     return {
@@ -239,6 +356,19 @@ def analyze_messages(commits: list[dict]) -> dict:
     }
 
 
+def trimmed_mean(values: list[float], trim_pct: float = 0.1) -> float:
+    """Compute a trimmed mean, removing the top and bottom trim_pct of values."""
+    if not values:
+        return 0.0
+    n = len(values)
+    k = int(n * trim_pct)
+    if k == 0 or n < 5:
+        return statistics.mean(values)
+    sorted_vals = sorted(values)
+    trimmed = sorted_vals[k : n - k]
+    return statistics.mean(trimmed) if trimmed else statistics.mean(values)
+
+
 def score_repo(
     velocities: list[dict],
     sessions: list[list[dict]],
@@ -247,129 +377,218 @@ def score_repo(
 ) -> dict:
     """
     Compute a composite LLM-likelihood score from 0-100.
+
+    Includes both positive signals (suspicious patterns) and negative
+    signals (clearly human patterns) that actively reduce the score.
     """
     score = 0.0
     reasons: list[str] = []
 
-    # --- 1. Velocity score (0-35 pts) ---
+    # --- 1. Velocity score (0-35 pts, can subtract up to -10) ---
     if velocities:
         lpms = [v["lines_per_minute"] for v in velocities]
         median_lpm = statistics.median(lpms)
+        # Use trimmed mean to resist outlier skew
+        tmean_lpm = trimmed_mean(lpms)
+
         suspicious_pct = sum(1 for l in lpms if l >= LPM_SUSPICIOUS) / len(lpms)
         very_suspicious_pct = sum(1 for l in lpms if l >= LPM_VERY_SUSPICIOUS) / len(
             lpms
         )
 
+        # Positive signals
         if median_lpm >= LPM_VERY_SUSPICIOUS:
             score += 35
             reasons.append(
-                f"Median velocity is extremely high ({median_lpm:.1f} lines/min ≈ {median_lpm * 60:.0f} lines/hr)"
+                f"Median velocity is extremely high ({median_lpm:.1f} lines/min "
+                f"≈ {median_lpm * 60:.0f} lines/hr)"
             )
         elif median_lpm >= LPM_SUSPICIOUS:
             score += 22
             reasons.append(
-                f"Median velocity is suspiciously high ({median_lpm:.1f} lines/min ≈ {median_lpm * 60:.0f} lines/hr)"
+                f"Median velocity is suspiciously high ({median_lpm:.1f} lines/min "
+                f"≈ {median_lpm * 60:.0f} lines/hr)"
             )
-        elif median_lpm >= LPM_HUMAN_TYPICAL:
-            score += 8
+        elif median_lpm >= LPM_HUMAN_UPPER:
+            score += 10
             reasons.append(
-                f"Median velocity is above typical human rate ({median_lpm:.1f} lines/min)"
+                f"Median velocity is above typical ({median_lpm:.1f} lines/min "
+                f"≈ {median_lpm * 60:.0f} lines/hr)"
+            )
+        # Negative signals — clearly human pace
+        elif median_lpm < LPM_CLEARLY_HUMAN:
+            penalty = -10
+            score += penalty
+            reasons.append(
+                f"Median velocity is consistent with human coding "
+                f"({median_lpm:.1f} lines/min ≈ {median_lpm * 60:.0f} lines/hr) [{penalty:+.0f}]"
             )
 
-        if very_suspicious_pct > 0.3:
-            score += min(10, very_suspicious_pct * 15)
+        # Suspicious interval percentage (only counts if substantial)
+        if very_suspicious_pct > 0.4:
+            pts = min(10, very_suspicious_pct * 15)
+            score += pts
             reasons.append(
-                f"{very_suspicious_pct * 100:.0f}% of commit intervals show very high velocity"
+                f"{very_suspicious_pct * 100:.0f}% of intervals show very high velocity"
             )
+        elif very_suspicious_pct > 0.2:
+            pts = min(5, very_suspicious_pct * 10)
+            score += pts
+            reasons.append(
+                f"{very_suspicious_pct * 100:.0f}% of intervals show high velocity"
+            )
+
     else:
         reasons.append("Not enough commit pairs to measure velocity")
 
-    # --- 2. Session productivity (0-20 pts) ---
+    # --- 2. Session productivity (0-20 pts, can subtract up to -5) ---
     session_productivities: list[float] = []
     for sess in sessions:
         if len(sess) < 2:
             continue
         duration = (sess[-1]["timestamp"] - sess[0]["timestamp"]).total_seconds() / 60.0
-        total_lines = sum(c["total_changes"] for c in sess)
+        # Use authored_total to avoid counting generated files
+        total_lines = sum(c["authored_total"] for c in sess)
         if duration >= 5:
             session_productivities.append(total_lines / duration)
 
     if session_productivities:
+        # Use trimmed mean to resist outlier sessions
+        tmean_session_prod = trimmed_mean(session_productivities)
         median_session_prod = statistics.median(session_productivities)
+
         if median_session_prod >= LPM_VERY_SUSPICIOUS:
             score += 20
             reasons.append(
-                f"Median session productivity is extreme ({median_session_prod:.1f} lines/min)"
+                f"Median session productivity is extreme "
+                f"({median_session_prod:.1f} lines/min)"
             )
         elif median_session_prod >= LPM_SUSPICIOUS:
             score += 12
             reasons.append(
-                f"Median session productivity is high ({median_session_prod:.1f} lines/min)"
+                f"Median session productivity is high "
+                f"({median_session_prod:.1f} lines/min)"
             )
-        elif median_session_prod >= LPM_HUMAN_TYPICAL * 2:
+        elif median_session_prod >= LPM_HUMAN_UPPER:
             score += 5
             reasons.append(
-                f"Session productivity is above average ({median_session_prod:.1f} lines/min)"
+                f"Session productivity is above average "
+                f"({median_session_prod:.1f} lines/min)"
+            )
+        elif median_session_prod < LPM_CLEARLY_HUMAN:
+            penalty = -5
+            score += penalty
+            reasons.append(
+                f"Session productivity is consistent with human pace "
+                f"({median_session_prod:.1f} lines/min) [{penalty:+.0f}]"
             )
 
     # --- 3. Commit size uniformity (0-15 pts) ---
-    sizes = [c["total_changes"] for c in commits if c["total_changes"] > 0]
+    # Use authored_total so generated files don't affect this
+    sizes = [c["authored_total"] for c in commits if c["authored_total"] > 0]
     if len(sizes) >= 5:
         mean_size = statistics.mean(sizes)
         stdev_size = statistics.stdev(sizes)
         cv = stdev_size / mean_size if mean_size > 0 else 0
+
         # Low coefficient of variation with large commits = suspicious
-        if cv < 0.4 and mean_size > 100:
+        # Humans are messy — their commits vary a LOT
+        if cv < 0.3 and mean_size > 150:
             score += 15
             reasons.append(
-                f"Commits are uniformly large (mean={mean_size:.0f}, CV={cv:.2f})"
+                f"Commits are suspiciously uniform and large "
+                f"(mean={mean_size:.0f} lines, CV={cv:.2f})"
             )
-        elif cv < 0.6 and mean_size > 80:
+        elif cv < 0.4 and mean_size > 100:
             score += 8
             reasons.append(
-                f"Commits are somewhat uniform in size (mean={mean_size:.0f}, CV={cv:.2f})"
+                f"Commits are somewhat uniform in size "
+                f"(mean={mean_size:.0f} lines, CV={cv:.2f})"
+            )
+        # High variation = human signal
+        elif cv > 1.5:
+            penalty = -5
+            score += penalty
+            reasons.append(
+                f"Commit sizes vary widely — typical of human work "
+                f"(CV={cv:.2f}) [{penalty:+.0f}]"
             )
 
     # --- 4. Commit message patterns (0-15 pts) ---
     msg_ratio = msg_analysis["ratio"]
-    if msg_ratio > 0.7:
+    if msg_ratio > 0.6:
         score += 15
         reasons.append(
             f"{msg_ratio * 100:.0f}% of commit messages match LLM-typical patterns"
         )
-    elif msg_ratio > 0.4:
+    elif msg_ratio > 0.35:
         score += 8
         reasons.append(
             f"{msg_ratio * 100:.0f}% of commit messages match LLM-typical patterns"
         )
-    elif msg_ratio > 0.2:
+    elif msg_ratio > 0.15:
         score += 3
         reasons.append(
             f"{msg_ratio * 100:.0f}% of commit messages match LLM-typical patterns"
         )
 
     # --- 5. Burst detection (0-15 pts) ---
+    # A burst = many commits with lots of authored code in a short window
     burst_count = 0
     for sess in sessions:
         if len(sess) >= 3:
             duration = (
                 sess[-1]["timestamp"] - sess[0]["timestamp"]
             ).total_seconds() / 60.0
-            total_lines = sum(c["total_changes"] for c in sess)
-            if duration < 30 and total_lines > 500:
+            total_authored = sum(c["authored_total"] for c in sess)
+            if duration < 30 and total_authored > 500:
                 burst_count += 1
 
     if burst_count >= 5:
         score += 15
-        reasons.append(f"{burst_count} burst sessions detected (>500 lines in <30 min)")
-    elif burst_count >= 2:
+        reasons.append(
+            f"{burst_count} burst sessions detected (>500 authored lines in <30 min)"
+        )
+    elif burst_count >= 3:
         score += 8
         reasons.append(f"{burst_count} burst sessions detected")
     elif burst_count >= 1:
         score += 3
         reasons.append(f"{burst_count} burst session detected")
 
-    score = min(score, 100)
+    # --- 6. Multi-author discount (0 to -10 pts) ---
+    authors = set()
+    for c in commits:
+        a = c.get("author_login") or c.get("author_name") or "unknown"
+        authors.add(a)
+
+    if len(authors) >= 5:
+        penalty = -10
+        score += penalty
+        reasons.append(
+            f"{len(authors)} distinct authors — multi-contributor project [{penalty:+.0f}]"
+        )
+    elif len(authors) >= 3:
+        penalty = -5
+        score += penalty
+        reasons.append(f"{len(authors)} distinct authors [{penalty:+.0f}]")
+    elif len(authors) == 1:
+        score += 5
+        reasons.append("Solo author — consistent with LLM-assisted workflow [+5]")
+
+    # --- 7. Generated file ratio signal ---
+    total_all_changes = sum(c["total_changes"] for c in commits)
+    total_generated = sum(c["generated_total"] for c in commits)
+    if total_all_changes > 0:
+        gen_ratio = total_generated / total_all_changes
+        if gen_ratio > 0.5:
+            reasons.append(
+                f"ℹ  {gen_ratio * 100:.0f}% of all line changes are in generated/vendor files "
+                f"(excluded from velocity calculations)"
+            )
+
+    # Clamp to 0-100
+    score = max(0, min(100, score))
 
     return {
         "score": round(score, 1),
@@ -393,6 +612,19 @@ def verdict(score: float) -> str:
         return "👤 Likely human-written"
     else:
         return "👤 Almost certainly human-written"
+
+
+def score_bar(score: float, width: int = 30) -> str:
+    """Render a visual score bar."""
+    filled = int(score / 100 * width)
+    empty = width - filled
+    if score >= 50:
+        char = "█"
+    elif score >= 30:
+        char = "▓"
+    else:
+        char = "░"
+    return f"[{char * filled}{'·' * empty}] {score:.0f}/100"
 
 
 def print_report(
@@ -425,18 +657,27 @@ def print_report(
     for a, count in sorted(authors.items(), key=lambda x: -x[1])[:5]:
         print(f"   • {a}: {count} commits")
 
+    # Generated file stats
+    total_all = sum(c["total_changes"] for c in commits)
+    total_authored = sum(c["authored_total"] for c in commits)
+    total_generated = sum(c["generated_total"] for c in commits)
+    print(f"\n📁 Line changes breakdown:")
+    print(f"   Total:     {total_all:,}")
+    print(f"   Authored:  {total_authored:,} (used for analysis)")
+    print(f"   Generated: {total_generated:,} (filtered out)")
+
     # Velocity stats
     if velocities:
         lpms = [v["lines_per_minute"] for v in velocities]
-        print(f"\n⚡ Velocity (lines/min between commits):")
+        median_lpm = statistics.median(lpms)
+        tmean_lpm = trimmed_mean(lpms)
+        print(f"\n⚡ Velocity (authored lines/min between commits):")
+        print(f"   Median:        {median_lpm:.2f}  (≈ {median_lpm * 60:.0f} lines/hr)")
+        print(f"   Trimmed mean:  {tmean_lpm:.2f}  (≈ {tmean_lpm * 60:.0f} lines/hr)")
+        print(f"   Max:           {max(lpms):.2f}")
+        suspicious_count = sum(1 for l in lpms if l >= LPM_SUSPICIOUS)
         print(
-            f"   Median: {statistics.median(lpms):.2f}  (≈ {statistics.median(lpms) * 60:.0f} lines/hr)"
-        )
-        print(f"   Mean:   {statistics.mean(lpms):.2f}")
-        print(f"   Max:    {max(lpms):.2f}")
-        print(
-            f"   Intervals above suspicious threshold: "
-            f"{sum(1 for l in lpms if l >= LPM_SUSPICIOUS)}/{len(lpms)}"
+            f"   Intervals above suspicious threshold: {suspicious_count}/{len(lpms)}"
         )
 
         # Top 5 fastest intervals
@@ -458,7 +699,8 @@ def print_report(
     # Messages
     print(
         f"\n💬 Commit messages matching LLM patterns: "
-        f"{msg_analysis['pattern_hits']}/{msg_analysis['total']} ({msg_analysis['ratio'] * 100:.1f}%)"
+        f"{msg_analysis['pattern_hits']}/{msg_analysis['total']} "
+        f"({msg_analysis['ratio'] * 100:.1f}%)"
     )
     if msg_analysis["sample_flagged"]:
         for m in msg_analysis["sample_flagged"][:5]:
@@ -466,7 +708,7 @@ def print_report(
 
     # Final score
     print(f"\n{'─' * w}")
-    print(f"  🎯 LLM Likelihood Score: {result['score']}/100")
+    print(f"  🎯 LLM Likelihood Score: {score_bar(result['score'])}")
     print(f"  {verdict(result['score'])}")
     print(f"{'─' * w}")
 
@@ -558,6 +800,10 @@ def main() -> None:
 
         detail = fetch_commit_detail(owner, repo, sha, args.token)
         stats = detail.get("stats", {})
+        files = detail.get("files", [])
+
+        # Separate authored vs generated file changes
+        change_breakdown = compute_authored_changes(files)
 
         commit_info = rc.get("commit", {})
         author_info = commit_info.get("author", {})
@@ -577,7 +823,12 @@ def main() -> None:
                 "additions": stats.get("additions", 0),
                 "deletions": stats.get("deletions", 0),
                 "total_changes": stats.get("total", 0),
-                "files_changed": len(detail.get("files", [])),
+                "files_changed": len(files),
+                # Filtered metrics
+                "authored_total": change_breakdown["authored_total"],
+                "authored_additions": change_breakdown["authored_additions"],
+                "authored_deletions": change_breakdown["authored_deletions"],
+                "generated_total": change_breakdown["generated_total"],
             }
         )
 
@@ -591,6 +842,7 @@ def main() -> None:
     result = score_repo(velocities, sessions, msg_analysis, commits)
 
     if args.json_output:
+        velocity_lpms = [v["lines_per_minute"] for v in velocities]
         output = {
             "repository": f"{owner}/{repo}",
             "commits_analyzed": len(commits),
@@ -598,15 +850,27 @@ def main() -> None:
             "verdict": verdict(result["score"]),
             "reasons": result["reasons"],
             "velocity_stats": {
-                "median_lpm": round(
-                    statistics.median([v["lines_per_minute"] for v in velocities]), 2
-                )
-                if velocities
+                "median_lpm": round(statistics.median(velocity_lpms), 2)
+                if velocity_lpms
+                else None,
+                "trimmed_mean_lpm": round(trimmed_mean(velocity_lpms), 2)
+                if velocity_lpms
                 else None,
                 "intervals": len(velocities),
             },
+            "line_changes": {
+                "total": sum(c["total_changes"] for c in commits),
+                "authored": sum(c["authored_total"] for c in commits),
+                "generated": sum(c["generated_total"] for c in commits),
+            },
             "message_analysis": msg_analysis,
             "sessions": len(sessions),
+            "authors": len(
+                set(
+                    c.get("author_login") or c.get("author_name") or "unknown"
+                    for c in commits
+                )
+            ),
         }
         print(json.dumps(output, indent=2, default=str))
     else:
