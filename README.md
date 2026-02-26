@@ -1,6 +1,7 @@
 # 🎲 Likelihoodlum
 
 [![GitHub stars](https://img.shields.io/github/stars/gotnull/likelihoodlum?style=social&cacheSeconds=60)](https://github.com/gotnull/likelihoodlum/stargazers)
+[![CI](https://github.com/gotnull/likelihoodlum/actions/workflows/ci.yml/badge.svg)](https://github.com/gotnull/likelihoodlum/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#installation)
@@ -152,12 +153,29 @@ Authors matching known bot patterns (e.g. `dependabot[bot]`, `renovate-bot`) are
 
 **Zero dependencies** — runs on Python 3.10+ with only the standard library.
 
+### Option A: pip install (recommended)
+
+```bash
+pip install git+https://github.com/gotnull/likelihoodlum.git
+```
+
+Then run it from anywhere:
+
+```bash
+likelihoodlum owner/repo
+```
+
+### Option B: Clone and run
+
 ```bash
 git clone https://github.com/gotnull/likelihoodlum.git
 cd likelihoodlum
+python3 llm_detector.py owner/repo
 ```
 
-Optionally install `python-dotenv` for `.env` file support (a built-in fallback parser is included if you don't):
+### Optional: `.env` file support
+
+Install `python-dotenv` for `.env` file support (a built-in fallback parser is included if you don't):
 
 ```bash
 pip install python-dotenv
