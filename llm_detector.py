@@ -47,7 +47,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # type: ignore
 except ImportError:
     # Fallback: manually parse .env if python-dotenv is not installed
     def load_dotenv(dotenv_path=None, **kwargs):
@@ -431,11 +431,23 @@ def score_repo(
                 f"≈ {median_lpm * 60:.0f} lines/hr)"
             )
         elif median_lpm >= LPM_SUSPICIOUS:
-            score += 22
+            # Boost if trimmed mean is much higher than median (long tail of
+            # fast intervals — classic LLM pattern)
+            base = 22
+            if tmean_lpm >= LPM_VERY_SUSPICIOUS:
+                base = 30
+            elif tmean_lpm >= median_lpm * 1.5:
+                base = 26
+            score += base
             reasons.append(
                 f"Median velocity is suspiciously high ({median_lpm:.1f} lines/min "
                 f"≈ {median_lpm * 60:.0f} lines/hr)"
             )
+            if tmean_lpm >= median_lpm * 1.5:
+                reasons.append(
+                    f"Trimmed mean ({tmean_lpm:.1f} l/min) is {tmean_lpm / median_lpm:.1f}× "
+                    f"the median — heavy tail of fast intervals"
+                )
         elif median_lpm >= LPM_HUMAN_UPPER:
             score += 10
             reasons.append(
@@ -451,7 +463,8 @@ def score_repo(
                 f"({median_lpm:.1f} lines/min ≈ {median_lpm * 60:.0f} lines/hr) [{penalty:+.0f}]"
             )
 
-        # Suspicious interval percentage (only counts if substantial)
+        # Suspicious interval percentage — use the broader suspicious_pct as
+        # a secondary check alongside the very_suspicious_pct.
         if very_suspicious_pct > 0.4:
             pts = min(10, very_suspicious_pct * 15)
             score += pts
@@ -463,6 +476,12 @@ def score_repo(
             score += pts
             reasons.append(
                 f"{very_suspicious_pct * 100:.0f}% of intervals show high velocity"
+            )
+        elif suspicious_pct > 0.4:
+            pts = min(5, suspicious_pct * 8)
+            score += pts
+            reasons.append(
+                f"{suspicious_pct * 100:.0f}% of intervals exceed suspicious threshold"
             )
 
     else:
@@ -569,8 +588,10 @@ def score_repo(
             )
 
     # --- 5. Burst detection (0-15 pts) ---
-    # A burst = commits with lots of authored code in a short window
+    # A burst = commits with lots of authored code in a short window,
+    # OR a session with extreme per-commit velocity.
     burst_count = 0
+    high_velocity_session_count = 0
     for sess in sessions:
         if len(sess) >= 2:
             duration = (
@@ -579,18 +600,24 @@ def score_repo(
             total_authored = sum(c["authored_total"] for c in sess)
             if duration < 30 and total_authored > 300:
                 burst_count += 1
+            # Also flag longer sessions with extreme throughput
+            elif duration >= 5 and total_authored / duration >= LPM_VERY_SUSPICIOUS:
+                high_velocity_session_count += 1
 
-    if burst_count >= 5:
+    total_burst_signals = burst_count + high_velocity_session_count
+
+    if total_burst_signals >= 5:
         score += 15
         reasons.append(
-            f"{burst_count} burst sessions detected (>300 authored lines in <30 min)"
+            f"{total_burst_signals} burst/high-velocity sessions detected "
+            f"({burst_count} rapid bursts, {high_velocity_session_count} sustained high-velocity)"
         )
-    elif burst_count >= 3:
+    elif total_burst_signals >= 3:
         score += 10
-        reasons.append(f"{burst_count} burst sessions detected")
-    elif burst_count >= 1:
+        reasons.append(f"{total_burst_signals} burst/high-velocity sessions detected")
+    elif total_burst_signals >= 1:
         score += 4
-        reasons.append(f"{burst_count} burst session detected")
+        reasons.append(f"{total_burst_signals} burst/high-velocity session detected")
 
     # --- 6. Multi-author discount (0 to -10 pts) ---
     # Exclude bot accounts from the author count
