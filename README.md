@@ -10,15 +10,30 @@ The core idea is simple: **humans type slow, LLMs don't.** If someone is pushing
 
 ## How It Works
 
-Likelihoodlum fetches commit history via the GitHub API and scores the repo on a 0–100 scale across five heuristics:
+Likelihoodlum fetches commit history via the GitHub API and scores the repo on a 0–100 scale across seven heuristic signals. Generated and vendored files (lockfiles, protobufs, Xcode project files, build artifacts, etc.) are **automatically filtered out** so they don't inflate velocity measurements.
 
-| Signal | Max Points | What It Measures |
-|---|---|---|
-| **Code Velocity** | 35 | Lines changed per minute between consecutive commits. Humans do ~30 LoC/hr; LLM-assisted work blows past 200+. |
-| **Session Productivity** | 20 | Groups commits into coding sessions (>2hr gap = new session) and measures aggregate output. |
-| **Burst Detection** | 15 | Flags sessions where >500 lines appeared in under 30 minutes. |
-| **Commit Size Uniformity** | 15 | LLM dumps tend to be uniformly large. Human commits vary (small fixes, big features, etc). |
-| **Commit Message Patterns** | 15 | Catches generic messages like *"Add feature"*, *"Implement X"*, *"Update file.py"* — the kind LLMs love. |
+### Scoring Signals
+
+| # | Signal | Points | What It Measures |
+|---|---|---|---|
+| 1 | **Code Velocity** | −10 to +35 | Lines changed per minute between consecutive commits by the same author. Thresholds: clearly human (~30 LoC/hr), human upper (~90 LoC/hr), suspicious (~240 LoC/hr), very suspicious (~600 LoC/hr). Also rewards clearly human pace with negative points. |
+| 2 | **Session Productivity** | −5 to +20 | Groups commits into coding sessions (>2hr gap = new session) and measures aggregate lines/min. Human-pace sessions actively reduce the score. |
+| 3 | **Commit Size Uniformity** | −5 to +15 | LLM dumps tend to be uniformly large. Human commits vary (small fixes, big features, etc). High variation is rewarded with negative points. |
+| 4 | **Commit Message Patterns** | 0 to +15 | Catches generic messages like *"Implement X"*, *"Add Y functionality"*, *"Fix issue with Z"* — the kind LLMs love to produce. |
+| 5 | **Burst Detection** | 0 to +15 | Flags sessions where >500 authored lines appeared in under 30 minutes. |
+| 6 | **Multi-Author Discount** | −10 to +5 | Real projects tend to have multiple contributors (penalty). Solo-author repos get a small bump. |
+| 7 | **Generated File Ratio** | Informational | Reports what percentage of line changes are in generated/vendor files (excluded from analysis). |
+
+> **Note:** The score uses both positive signals (suspicious patterns push the score up) and negative signals (clearly human patterns actively pull it down). The final score is clamped to 0–100.
+
+### Velocity Thresholds
+
+| Threshold | Lines/Min | Lines/Hr | Interpretation |
+|---|---|---|---|
+| Clearly Human | < 0.5 | < 30 | Normal productive human |
+| Human Upper | < 1.5 | < 90 | Fast human, maybe some copy-paste |
+| Suspicious | ≥ 4.0 | ≥ 240 | Quite fast, could be assisted |
+| Very Suspicious | ≥ 10.0 | ≥ 600 | Almost certainly not hand-typed |
 
 ### Verdicts
 
@@ -29,6 +44,16 @@ Likelihoodlum fetches commit history via the GitHub API and scores the repo on a
 | 30–49 | 🤔 Possibly LLM-assisted |
 | 15–29 | 👤 Likely human-written |
 | 0–14 | 👤 Almost certainly human-written |
+
+### Generated File Filtering
+
+The following file types are automatically excluded from velocity and size calculations:
+
+- **Lock files**: `package-lock.json`, `yarn.lock`, `Podfile.lock`, `Cargo.lock`, `go.sum`, etc.
+- **Xcode / Apple**: `.pbxproj`, `.xcworkspacedata`, `.xcscheme`
+- **Protobuf / codegen**: `.pb.go`, `.pb.swift`, `_pb2.py`, `.g.dart`, `.freezed.dart`, `.generated.*`
+- **Build artifacts**: `.min.js`, `.min.css`, `.map`, `dist/`, `build/`, `vendor/`, `node_modules/`
+- **Data / assets**: `.json`, `.svg`, `.png`, `.jpg`, `.ico`, fonts
 
 ## Installation
 
@@ -104,6 +129,16 @@ python3 llm_detector.py owner/repo --json
 python3 llm_detector.py owner/repo --max-commits 5000 --json > report.json
 ```
 
+### CLI Reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `repo` (positional) | — | GitHub repo as `owner/repo` or full URL |
+| `--token` | `$GITHUB_TOKEN` | GitHub personal access token |
+| `--branch` | repo default | Branch to analyze |
+| `--max-commits` | `200` | Maximum number of commits to fetch |
+| `--json` | off | Output results as JSON |
+
 ### Example Output
 
 ```
@@ -117,15 +152,22 @@ python3 llm_detector.py owner/repo --max-commits 5000 --json > report.json
 👥 Authors: 1
    • devguy42: 200 commits
 
-⚡ Velocity (lines/min between commits):
-   Median: 9.40  (≈ 564 lines/hr)
-   Mean:   14.22
-   Max:    87.50
+📁 Line changes breakdown:
+   Total:     48,230
+   Authored:  41,500 (used for analysis)
+   Generated: 6,730 (filtered out)
+
+⚡ Velocity (authored lines/min between commits):
+   Median:        9.40  (≈ 564 lines/hr)
+   Trimmed mean:  8.12  (≈ 487 lines/hr)
+   Max:           87.50
    Intervals above suspicious threshold: 143/198
 
 🔥 Fastest commit intervals:
    a1b2c3d4→e5f6g7h8  1750 lines in 20.0 min = 87.5 l/min ⚠️
    ...
+
+🕐 Coding sessions (gap > 120 min): 15
 
 💬 Commit messages matching LLM patterns: 168/200 (84.0%)
    • "Add user authentication module"
@@ -133,20 +175,53 @@ python3 llm_detector.py owner/repo --max-commits 5000 --json > report.json
    • "Update README.md"
 
 ────────────────────────────────────────────────────────────
-  🎯 LLM Likelihood Score: 82/100
+  🎯 LLM Likelihood Score: [████████████████████████······] 82/100
   🤖 Very likely LLM-generated
 ────────────────────────────────────────────────────────────
 
 📝 Reasoning:
    • Median velocity is extremely high (9.4 lines/min ≈ 564 lines/hr)
-   • 72% of commit intervals show very high velocity
+   • 72% of intervals show very high velocity
    • Median session productivity is extreme (11.2 lines/min)
    • 84% of commit messages match LLM-typical patterns
-   • 6 burst sessions detected (>500 lines in <30 min)
+   • 6 burst sessions detected (>500 authored lines in <30 min)
+   • Solo author — consistent with LLM-assisted workflow [+5]
 
 ⚠  Disclaimer: This is a heuristic analysis and NOT definitive proof.
    Fast coding can also indicate copy-paste, boilerplate generators,
    IDE scaffolding, or simply an experienced developer.
+```
+
+### JSON Output
+
+When using `--json`, the output includes:
+
+```json
+{
+  "repository": "owner/repo",
+  "commits_analyzed": 200,
+  "score": 82,
+  "verdict": "🤖 Very likely LLM-generated",
+  "reasons": ["..."],
+  "velocity_stats": {
+    "median_lpm": 9.4,
+    "trimmed_mean_lpm": 8.12,
+    "intervals": 198
+  },
+  "line_changes": {
+    "total": 48230,
+    "authored": 41500,
+    "generated": 6730
+  },
+  "message_analysis": {
+    "total": 200,
+    "pattern_hits": 168,
+    "ratio": 0.84,
+    "sample_flagged": ["..."]
+  },
+  "sessions": 15,
+  "authors": 1
+}
 ```
 
 ## API Rate Limits
