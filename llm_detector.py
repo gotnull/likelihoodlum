@@ -39,7 +39,7 @@ import os
 import re
 import statistics
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -414,6 +414,160 @@ def trimmed_mean(values: list[float], trim_pct: float = 0.1) -> float:
     return statistics.mean(trimmed) if trimmed else statistics.mean(values)
 
 
+# ---------------------------------------------------------------------------
+# Comment density helpers
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a comment line (added lines from patches)
+_COMMENT_PATTERNS = [
+    re.compile(r"^\s*//"),  # C/C++/Java/JS/Go/Rust/Swift/Dart
+    re.compile(r"^\s*#(?!!)"),  # Python/Ruby/Shell (but not shebangs)
+    re.compile(r"^\s*\*"),  # Block comment continuation
+    re.compile(r"^\s*/\*"),  # Block comment start
+    re.compile(r"^\s*\*/"),  # Block comment end
+    re.compile(r"^\s*<!--"),  # HTML comment
+    re.compile(r"^\s*--"),  # SQL/Lua comment
+    re.compile(r'^\s*"""'),  # Python docstring
+    re.compile(r"^\s*'''"),  # Python docstring
+]
+
+
+def _is_comment_line(line: str) -> bool:
+    """Check if a source line looks like a comment."""
+    for pat in _COMMENT_PATTERNS:
+        if pat.match(line):
+            return True
+    return False
+
+
+def analyze_comment_density(commits: list[dict]) -> dict:
+    """
+    Analyze the ratio of comment lines to code lines in added content.
+
+    Uses the patch data stored on each commit's files.
+    Returns dict with comment_ratio, total_comment_lines, total_code_lines.
+    """
+    total_comment = 0
+    total_code = 0
+
+    for c in commits:
+        for patch_text in c.get("patches", []):
+            for line in patch_text.split("\n"):
+                # Only look at added lines (start with +, but not +++ header)
+                if line.startswith("+") and not line.startswith("+++"):
+                    content = line[1:]  # strip the leading +
+                    stripped = content.strip()
+                    if not stripped:
+                        continue  # skip blank lines
+                    if _is_comment_line(stripped):
+                        total_comment += 1
+                    else:
+                        total_code += 1
+
+    total = total_comment + total_code
+    return {
+        "total_comment_lines": total_comment,
+        "total_code_lines": total_code,
+        "comment_ratio": round(total_comment / total, 3) if total > 0 else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Commit time-of-day helpers
+# ---------------------------------------------------------------------------
+
+
+def analyze_commit_times(commits: list[dict]) -> dict:
+    """
+    Analyze the distribution of commit timestamps by hour of day.
+
+    Returns dict with hour distribution, off-hours commit count, and
+    off-hours high-velocity count.
+    """
+    hour_counts: Counter = Counter()
+    off_hours_commits = 0  # commits between midnight and 6am
+    total_non_bot = 0
+
+    for c in commits:
+        author = c.get("author_login") or c.get("author_name") or "unknown"
+        if is_bot_author(author):
+            continue
+        total_non_bot += 1
+        ts = c["timestamp"]
+        hour = ts.hour
+        hour_counts[hour] += 1
+        if 0 <= hour < 6:
+            off_hours_commits += 1
+
+    off_hours_pct = off_hours_commits / total_non_bot if total_non_bot > 0 else 0
+
+    return {
+        "total_commits": total_non_bot,
+        "off_hours_commits": off_hours_commits,
+        "off_hours_pct": round(off_hours_pct, 3),
+        "hour_distribution": dict(sorted(hour_counts.items())),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Diff entropy helpers
+# ---------------------------------------------------------------------------
+
+
+def _shannon_entropy(text: str) -> float:
+    """Compute Shannon entropy of a string (bits per character)."""
+    if not text:
+        return 0.0
+    freq: Counter = Counter(text)
+    length = len(text)
+    entropy = 0.0
+    for count in freq.values():
+        p = count / length
+        if p > 0:
+            entropy -= p * math.log2(p)
+    return entropy
+
+
+def analyze_diff_entropy(commits: list[dict]) -> dict:
+    """
+    Analyze the Shannon entropy of diff content across commits.
+
+    Lower entropy = more repetitive/predictable (LLM signal).
+    Higher entropy = more varied/chaotic (human signal).
+
+    Returns dict with median entropy, mean entropy, and per-commit entropies.
+    """
+    commit_entropies: list[float] = []
+
+    for c in commits:
+        # Concatenate all added lines from patches
+        added_lines = []
+        for patch_text in c.get("patches", []):
+            for line in patch_text.split("\n"):
+                if line.startswith("+") and not line.startswith("+++"):
+                    added_lines.append(line[1:])
+
+        if len(added_lines) < 5:
+            continue  # skip tiny commits — not enough signal
+
+        combined = "\n".join(added_lines)
+        ent = _shannon_entropy(combined)
+        commit_entropies.append(ent)
+
+    if not commit_entropies:
+        return {
+            "median_entropy": None,
+            "mean_entropy": None,
+            "num_commits_measured": 0,
+        }
+
+    return {
+        "median_entropy": round(statistics.median(commit_entropies), 3),
+        "mean_entropy": round(statistics.mean(commit_entropies), 3),
+        "num_commits_measured": len(commit_entropies),
+    }
+
+
 def score_repo(
     velocities: list[dict],
     sessions: list[list[dict]],
@@ -676,7 +830,76 @@ def score_repo(
                 f"show extreme velocity (>50 lines/min ≈ 3000 lines/hr) [{pts:+.0f}]"
             )
 
-    # --- 8. Project-scale plausibility (0-20 pts, can subtract up to -5) ---
+    # --- 8. Commit time-of-day analysis (0-5 pts) ---
+    # High-velocity work during off-hours (midnight–6am) is suspicious.
+    time_analysis = analyze_commit_times(commits)
+    if time_analysis["total_commits"] >= 10:
+        off_pct = time_analysis["off_hours_pct"]
+        if off_pct > 0.3 and velocities:
+            median_check = statistics.median(
+                [v["lines_per_minute"] for v in velocities]
+            )
+            if median_check >= LPM_SUSPICIOUS:
+                score += 5
+                reasons.append(
+                    f"{off_pct * 100:.0f}% of commits are off-hours (midnight–6am) "
+                    f"with high velocity [+5]"
+                )
+
+    # --- 9. Comment density analysis (0-5 pts, can subtract up to -3) ---
+    comment_analysis = analyze_comment_density(commits)
+    comment_ratio = comment_analysis["comment_ratio"]
+    if comment_analysis["total_code_lines"] >= 100:
+        if comment_ratio >= 0.35:
+            score += 5
+            reasons.append(
+                f"Comment density is very high ({comment_ratio * 100:.0f}% of added lines "
+                f"are comments) — LLMs over-explain [+5]"
+            )
+        elif comment_ratio >= 0.25:
+            score += 3
+            reasons.append(
+                f"Comment density is above average ({comment_ratio * 100:.0f}% of added lines "
+                f"are comments) [+3]"
+            )
+        elif comment_ratio < 0.05 and comment_analysis["total_code_lines"] >= 500:
+            penalty = -3
+            score += penalty
+            reasons.append(
+                f"Very low comment density ({comment_ratio * 100:.1f}%) — "
+                f"typical human laziness [{penalty:+.0f}]"
+            )
+
+    # --- 10. Diff entropy analysis (0-5 pts, can subtract up to -3) ---
+    entropy_analysis = analyze_diff_entropy(commits)
+    if (
+        entropy_analysis["median_entropy"] is not None
+        and entropy_analysis["num_commits_measured"] >= 10
+    ):
+        median_ent = entropy_analysis["median_entropy"]
+        # Source code typically has entropy around 4.5-5.5 bits/char.
+        # LLM code tends toward lower entropy (more formulaic/repetitive).
+        # Very high entropy suggests varied, chaotic human work.
+        if median_ent < 4.0:
+            score += 5
+            reasons.append(
+                f"Diff entropy is low ({median_ent:.2f} bits/char) — "
+                f"diffs are repetitive/formulaic [+5]"
+            )
+        elif median_ent < 4.3:
+            score += 3
+            reasons.append(
+                f"Diff entropy is below average ({median_ent:.2f} bits/char) [+3]"
+            )
+        elif median_ent > 5.5:
+            penalty = -3
+            score += penalty
+            reasons.append(
+                f"Diff entropy is high ({median_ent:.2f} bits/char) — "
+                f"varied, chaotic human work [{penalty:+.0f}]"
+            )
+
+    # --- 11. Project-scale plausibility (0-20 pts, can subtract up to -5) ---
     # Compare total authored output against the project's true lifespan.
     # Use the repo creation date (from GitHub metadata) when available,
     # otherwise fall back to the oldest fetched commit.
@@ -735,7 +958,7 @@ def score_repo(
                 f"{daily_rate:,.0f} lines/active day over {calendar_days:.0f} days [{penalty:+.0f}]"
             )
 
-    # --- 9. Generated file ratio signal ---
+    # --- 12. Generated file ratio signal ---
     total_all_changes = sum(c["total_changes"] for c in commits)
     total_generated = sum(c["generated_total"] for c in commits)
     if total_all_changes > 0:
@@ -860,6 +1083,15 @@ def print_report(
         if flag:
             print(f"   {flag}")
 
+    # Time-of-day analysis
+    time_analysis = analyze_commit_times(commits)
+    if time_analysis["total_commits"] >= 10:
+        print(f"\n🕐 Commit time distribution:")
+        off_pct = time_analysis["off_hours_pct"]
+        print(
+            f"   Off-hours (midnight–6am): {time_analysis['off_hours_commits']}/{time_analysis['total_commits']} ({off_pct * 100:.0f}%)"
+        )
+
     # Velocity stats
     if velocities:
         lpms = [v["lines_per_minute"] for v in velocities]
@@ -887,8 +1119,25 @@ def print_report(
     # Sessions
     multi_sessions = [s for s in sessions if len(s) >= 2]
     print(
-        f"\n🕐 Coding sessions (gap > {SESSION_GAP_MINUTES} min): {len(multi_sessions)}"
+        f"\n📋 Coding sessions (gap > {SESSION_GAP_MINUTES} min): {len(multi_sessions)}"
     )
+
+    # Comment density
+    comment_analysis = analyze_comment_density(commits)
+    if comment_analysis["total_code_lines"] >= 100:
+        print(
+            f"\n💬 Comment density: {comment_analysis['comment_ratio'] * 100:.1f}% "
+            f"({comment_analysis['total_comment_lines']:,} comment lines / "
+            f"{comment_analysis['total_code_lines']:,} code lines)"
+        )
+
+    # Diff entropy
+    entropy_analysis = analyze_diff_entropy(commits)
+    if entropy_analysis["median_entropy"] is not None:
+        print(
+            f"\n🔀 Diff entropy: {entropy_analysis['median_entropy']:.2f} bits/char "
+            f"(median across {entropy_analysis['num_commits_measured']} commits)"
+        )
 
     # Messages
     print(
@@ -1042,6 +1291,13 @@ def main() -> None:
             # Separate authored vs generated file changes
             change_breakdown = compute_authored_changes(files)
 
+            # Extract patch text from authored files for comment/entropy analysis
+            patches = []
+            for f in files:
+                fname = f.get("filename", "")
+                if not is_generated_file(fname) and "patch" in f:
+                    patches.append(f["patch"])
+
             commit_info = rc.get("commit", {})
             author_info = commit_info.get("author", {})
             committer_info = commit_info.get("committer", {})
@@ -1067,6 +1323,8 @@ def main() -> None:
                     "authored_additions": change_breakdown["authored_additions"],
                     "authored_deletions": change_breakdown["authored_deletions"],
                     "generated_total": change_breakdown["generated_total"],
+                    # Patch content for comment/entropy analysis
+                    "patches": patches,
                 }
             )
 
@@ -1078,6 +1336,11 @@ def main() -> None:
     sessions = build_sessions(commits)
     msg_analysis = analyze_messages(commits)
     result = score_repo(velocities, sessions, msg_analysis, commits, repo_created_at)
+
+    # Pre-compute analyses used by both report and JSON output
+    _comment_analysis = analyze_comment_density(commits)
+    _entropy_analysis = analyze_diff_entropy(commits)
+    _time_analysis = analyze_commit_times(commits)
 
     if args.json_output:
         velocity_lpms = [v["lines_per_minute"] for v in velocities]
@@ -1150,6 +1413,20 @@ def main() -> None:
             )()
             if commits
             else None,
+            "comment_density": {
+                "comment_ratio": _comment_analysis["comment_ratio"],
+                "comment_lines": _comment_analysis["total_comment_lines"],
+                "code_lines": _comment_analysis["total_code_lines"],
+            },
+            "diff_entropy": {
+                "median": _entropy_analysis["median_entropy"],
+                "mean": _entropy_analysis["mean_entropy"],
+                "commits_measured": _entropy_analysis["num_commits_measured"],
+            },
+            "commit_times": {
+                "off_hours_pct": _time_analysis["off_hours_pct"],
+                "off_hours_commits": _time_analysis["off_hours_commits"],
+            },
             "message_analysis": msg_analysis,
             "sessions": len(sessions),
             "authors": len(

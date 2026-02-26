@@ -82,7 +82,7 @@ Because who better to test an LLM detector on than the company *making* the LLMs
 
 ## How It Works
 
-Likelihoodlum fetches commit history and repository metadata via the GitHub API, then scores the repo on a 0–100 scale across nine heuristic signals. Generated and vendored files (lockfiles, protobufs, Xcode project files, build artifacts, etc.) are **automatically filtered out** so they don't inflate velocity measurements. Bot accounts (e.g. `dependabot[bot]`) are excluded from author counts and velocity calculations.
+Likelihoodlum fetches commit history and repository metadata via the GitHub API, then scores the repo on a 0–100 scale across twelve heuristic signals. Generated and vendored files (lockfiles, protobufs, Xcode project files, build artifacts, etc.) are **automatically filtered out** so they don't inflate velocity measurements. Bot accounts (e.g. `dependabot[bot]`) are excluded from author counts and velocity calculations.
 
 Commit details are fetched **concurrently** (up to 10 parallel requests) for significantly faster analysis, and bot commits are skipped entirely to save API calls.
 
@@ -97,10 +97,13 @@ Commit details are fetched **concurrently** (up to 10 parallel requests) for sig
 | 5 | **Burst Detection** | 0 to +15 | Flags sessions where >300 authored lines appeared in under 30 minutes (rapid bursts), plus longer sessions with sustained extreme throughput (≥10 lines/min). |
 | 6 | **Multi-Author Discount** | −10 to +5 | Real projects tend to have multiple contributors (score penalty). Solo-author repos get a small bump. Bot accounts are excluded from the count. |
 | 7 | **Extreme Per-Commit Velocity** | 0 to +10 | Counts commit intervals exceeding 50 lines/min (~3,000 lines/hr). Even a small percentage of these is a strong signal. |
-| 8 | **Project-Scale Plausibility** | −5 to +20 | The big-picture sanity check. Compares total authored output against the repo's true creation date (fetched from GitHub metadata) and active coding days. A senior engineer produces ~200–500 lines of production code per day — 10,000+ lines/day sustained over weeks is implausible without LLM assistance. |
-| 9 | **Generated File Ratio** | Informational | Reports what percentage of line changes are in generated/vendor files (excluded from all calculations above). |
+| 8 | **Commit Time-of-Day** | 0 to +5 | Flags repos where >30% of commits happen between midnight–6am *and* velocity is suspicious. Humans have circadian rhythms; LLMs don't sleep. |
+| 9 | **Comment Density** | −3 to +5 | LLMs over-explain — they add verbose comments, docstrings, and inline explanations at a much higher rate than most humans. Very low comment density (typical human laziness) earns a negative signal. |
+| 10 | **Diff Entropy** | −3 to +5 | Measures Shannon entropy of diff content. LLM-generated diffs tend to be more repetitive/formulaic (lower entropy). Human diffs are messier and more varied (higher entropy). |
+| 11 | **Project-Scale Plausibility** | −5 to +20 | The big-picture sanity check. Compares total authored output against the repo's true creation date (fetched from GitHub metadata) and active coding days. A senior engineer produces ~200–500 lines of production code per day — 10,000+ lines/day sustained over weeks is implausible without LLM assistance. |
+| 12 | **Generated File Ratio** | Informational | Reports what percentage of line changes are in generated/vendor files (excluded from all calculations above). |
 
-> **Note:** The score uses both positive signals (suspicious patterns push the score up) and negative signals (clearly human patterns actively pull it down). The final score is clamped to 0–100.
+> **Note:** The score uses both positive signals (suspicious patterns push the score up) and negative signals (clearly human patterns actively pull it down). The final score is clamped to 0–100. Patch content from commit diffs is analyzed for comment density and entropy calculations.
 
 ### Velocity Thresholds
 
@@ -120,6 +123,24 @@ Commit details are fetched **concurrently** (up to 10 parallel requests) for sig
 | 800–1,999 | Above average | +5 |
 | 2,000–4,999 | Very high, likely assisted | +12 |
 | ≥ 5,000 | Implausible for a human | +20 |
+
+### Comment Density Thresholds
+
+| Comment Ratio | Interpretation | Points |
+|---|---|---|
+| < 5% | Human laziness | −3 |
+| 5–24% | Normal range | 0 |
+| 25–34% | Above average | +3 |
+| ≥ 35% | LLM over-commenting | +5 |
+
+### Diff Entropy Thresholds
+
+| Entropy (bits/char) | Interpretation | Points |
+|---|---|---|
+| > 5.5 | Varied, chaotic (human) | −3 |
+| 4.3–5.5 | Normal range | 0 |
+| 4.0–4.3 | Below average | +3 |
+| < 4.0 | Repetitive/formulaic (LLM) | +5 |
 
 ### Verdicts
 
@@ -390,12 +411,12 @@ MIT — do whatever you want with it.
 
 Found a new heuristic? PRs welcome. Ideas:
 
-- Diff complexity scoring (entropy analysis)
 - File-type breakdown (LLMs love generating configs)
-- Comment density analysis
 - Code style consistency metrics
+- Cross-file similarity detection (LLMs repeat patterns)
 - Cross-referencing with known LLM output patterns
 - Language-specific signal tuning
+- Timezone inference from commit patterns
 
 ---
 

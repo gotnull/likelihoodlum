@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "likelihoodlum"
-version = "1.0.0"
+version = "1.1.0"
 description = "🎲 Detect whether a GitHub repo's code was likely written by an LLM"
 readme = "README.md"
 license = {text = "MIT"}

@@ -2,6 +2,28 @@
 
 All notable changes to Likelihoodlum are documented here.
 
+## [1.1.0] — 2026-02-26
+
+### Three New Heuristics 🔬
+
+Added comment density, commit time-of-day, and diff entropy analysis — bringing the total to twelve scoring signals.
+
+### Added
+
+- **Commit Time-of-Day Analysis** (0 to +5 pts) — Flags repos where >30% of commits happen between midnight–6am with suspicious velocity. Humans have circadian rhythms; LLMs don't sleep.
+- **Comment Density Analysis** (−3 to +5 pts) — Measures the ratio of comment lines to code lines in added content. LLMs over-explain (≥35% comments → +5); humans are lazier (<5% → −3).
+- **Diff Entropy Analysis** (−3 to +5 pts) — Computes Shannon entropy of diff content per commit. LLM diffs are more repetitive/formulaic (low entropy → +5); human diffs are varied and chaotic (high entropy → −3).
+- New report sections: `🕐 Commit time distribution`, `💬 Comment density`, `🔀 Diff entropy`
+- Patch content extraction from commit details for comment and entropy analysis
+- `comment_density`, `diff_entropy`, and `commit_times` fields in JSON output
+- Comment line detection for Python, C/C++, Java, JS, Go, Rust, Swift, Dart, SQL, Lua, HTML
+
+### Changed
+
+- Total scoring signals increased from 9 to 12
+- Signal numbering updated (project-scale plausibility is now #11, generated file ratio is now #12)
+- Removed "diff complexity scoring" and "comment density analysis" from Contributing ideas (now implemented)
+
 ## [1.0.0] — 2026-02-26
 
 ### The Public Release 🎲
